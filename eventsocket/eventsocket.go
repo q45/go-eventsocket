@@ -339,9 +339,9 @@ func capitalize(s string) string {
 // details.
 func (h *Connection) Send(command string) (*Event, error) {
 	// Sanity check to avoid breaking the parser
-	if strings.IndexAny(command, "\r\n") > 0 {
-		return nil, errInvalidCommand
-	}
+	//if strings.IndexAny(command, "\r\n") > 0 {
+	//	return nil, errInvalidCommand
+	//}
 	fmt.Fprintf(h.conn, "%s\r\n\r\n", command)
 	var (
 		ev  *Event
@@ -467,6 +467,18 @@ func (r EventHeader) Get(key string) string {
 	return ""
 }
 
+// return slice of variables (created when using `push` action in FreeSWITCH)
+func (r EventHeader) GetSlice(key string) []string {
+	var s []string
+	if v, ok := r[key]; ok {
+		a := v.([]interface{})
+		for _, d := range a {
+			s = append(s, d.(string))
+		}
+	}
+	return s
+}
+
 // Event represents a FreeSWITCH event.
 type Event struct {
 	Header EventHeader // Event headers, key:val
@@ -484,6 +496,11 @@ func (r *Event) String() string {
 // Get returns an Event value, or "" if the key doesn't exist.
 func (r *Event) Get(key string) string {
 	return r.Header.Get(key)
+}
+
+// Get returns an Event value, or "" if the key doesn't exist.
+func (r *Event) GetSlice(key string) []string {
+	return r.Header.GetSlice(key)
 }
 
 // GetInt returns an Event value converted to int, or an error if conversion
