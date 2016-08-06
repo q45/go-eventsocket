@@ -29,10 +29,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/weave-lab/go-utilities/uuid"
 )
 
 const bufferSize = 1024 << 6 // For the socket reader
 const eventsBuffer = 16      // For the events channel (memory eater!)
+const requestTimeout = 2000
 
 var errMissingAuthRequest = errors.New("Missing auth request")
 var errInvalidPassword = errors.New("Invalid password")
@@ -45,6 +49,63 @@ type Connection struct {
 	textreader    *textproto.Reader
 	err           chan error
 	cmd, api, evt chan *Event
+	hub           *RequestHub
+}
+
+// Request is a bgapi request struct
+type Request struct {
+	UUID      string
+	timestamp time.Time
+	resp      chan *Event
+	err       chan error
+	command   string
+}
+
+// RequestHub is the asyn request/reply hub for bgapi commands
+type RequestHub struct {
+	requests  map[string]*Request
+	inbound   chan *Request
+	responses chan *Event
+	timeout   chan bool
+}
+
+func (h *RequestHub) run() {
+	go func() {
+		for {
+			time.Sleep(1 * time.Second)
+			h.timeout <- true
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case request := <-h.inbound:
+				h.requests[request.UUID] = request
+			case response := <-h.responses:
+				req, ok := h.requests[response.Header["Job-Uuid"].(string)]
+				if ok != true {
+					break
+				}
+				reply := response.Body
+				if strings.HasPrefix(reply, "-E") {
+					if len(reply) > 5 {
+						req.err <- errors.New(reply[5:])
+					} else {
+						req.err <- errors.New(reply)
+					}
+					break
+				}
+				req.resp <- response
+				delete(h.requests, req.UUID)
+			case _ = <-h.timeout:
+				for _, req := range h.requests {
+					if time.Since(req.timestamp) > (time.Millisecond * requestTimeout) {
+						req.err <- fmt.Errorf("bgapi command '%s' timed out", req.command)
+					}
+				}
+			}
+		}
+	}()
 }
 
 // newConnection allocates a new Connection and initialize its buffers.
@@ -57,6 +118,14 @@ func newConnection(c net.Conn) *Connection {
 		api:    make(chan *Event),
 		evt:    make(chan *Event, eventsBuffer),
 	}
+	hub := &RequestHub{
+		requests:  make(map[string]*Request),
+		inbound:   make(chan *Request),
+		responses: make(chan *Event),
+		timeout:   make(chan bool),
+	}
+	h.hub = hub
+	h.hub.run()
 	h.textreader = textproto.NewReader(h.reader)
 	return &h
 }
@@ -138,6 +207,8 @@ func Dial(addr, passwd string) (*Connection, error) {
 		return nil, errInvalidPassword
 	}
 	go h.readLoop()
+	// subscribe to `BACKGROUND_JOB` on connect
+	go h.Send("events json BACKGROUND_JOB")
 	return h, err
 }
 
@@ -241,6 +312,11 @@ func (h *Connection) readOne() bool {
 		} else {
 			resp.Body = ""
 		}
+		// we dont return `BACKGROUND_JOB` events
+		if resp.Header["Event-Name"] == "BACKGROUND_JOB" {
+			h.hub.responses <- resp
+			return true
+		}
 		h.evt <- resp
 	case "text/disconnect-notice":
 		copyHeaders(&hdr, resp, false)
@@ -339,9 +415,9 @@ func capitalize(s string) string {
 // details.
 func (h *Connection) Send(command string) (*Event, error) {
 	// Sanity check to avoid breaking the parser
-	if strings.IndexAny(command, "\r\n") > 0 {
-		return nil, errInvalidCommand
-	}
+	//if strings.IndexAny(command, "\r\n") > 0 {
+	//	return nil, errInvalidCommand
+	//}
 	fmt.Fprintf(h.conn, "%s\r\n\r\n", command)
 	var (
 		ev  *Event
@@ -353,6 +429,32 @@ func (h *Connection) Send(command string) (*Event, error) {
 	case ev = <-h.cmd:
 		return ev, nil
 	case ev = <-h.api:
+		return ev, nil
+	}
+}
+
+// Bgapi runs a background api request on freeswitch
+func (h *Connection) Bgapi(command string) (*Event, error) {
+	req := &Request{}
+	req.resp = make(chan *Event)
+	req.err = make(chan error)
+	req.command = command
+	req.timestamp = time.Now()
+
+	u := uuid.NewV4()
+	jobID, _ := uuid.Formatter(u, uuid.CleanHyphen)
+	req.UUID = jobID
+	h.hub.inbound <- req
+
+	_, err := h.Send(fmt.Sprintf("bgapi %s\r\njob-uuid: %s", command, jobID))
+	if err != nil {
+		return &Event{}, err
+	}
+
+	select {
+	case err := <-req.err:
+		return &Event{}, err
+	case ev := <-req.resp:
 		return ev, nil
 	}
 }
@@ -467,6 +569,22 @@ func (r EventHeader) Get(key string) string {
 	return ""
 }
 
+// return slice of variables (created when using `push` action in FreeSWITCH)
+func (r EventHeader) GetSlice(key string) []string {
+	var s []string
+	if v, ok := r[key]; ok {
+		a, b := v.([]interface{})
+		if b == true {
+			for _, d := range a {
+				s = append(s, d.(string))
+			}
+		} else {
+			s = append(s, r.Get(key))
+		}
+	}
+	return s
+}
+
 // Event represents a FreeSWITCH event.
 type Event struct {
 	Header EventHeader // Event headers, key:val
@@ -484,6 +602,11 @@ func (r *Event) String() string {
 // Get returns an Event value, or "" if the key doesn't exist.
 func (r *Event) Get(key string) string {
 	return r.Header.Get(key)
+}
+
+// Get returns an Event value, or "" if the key doesn't exist.
+func (r *Event) GetSlice(key string) []string {
+	return r.Header.GetSlice(key)
 }
 
 // GetInt returns an Event value converted to int, or an error if conversion
